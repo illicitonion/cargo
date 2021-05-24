@@ -312,6 +312,7 @@
 //! See the `A-rebuild-detection` flag on the issue tracker for more:
 //! <https://github.com/rust-lang/cargo/issues?q=is%3Aissue+is%3Aopen+label%3AA-rebuild-detection>
 
+use std::borrow::Cow;
 use std::collections::hash_map::{Entry, HashMap};
 use std::convert::TryInto;
 use std::env;
@@ -325,6 +326,7 @@ use anyhow::{bail, format_err, Context as _};
 use cargo_util::{paths, ProcessBuilder};
 use filetime::FileTime;
 use log::{debug, info};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::de;
 use serde::ser;
 use serde::{Deserialize, Serialize};
@@ -334,7 +336,7 @@ use crate::core::Package;
 use crate::util;
 use crate::util::errors::CargoResult;
 use crate::util::interning::InternedString;
-use crate::util::{internal, path_args, profile};
+use crate::util::{internal, path_args, profile, StableHasher};
 use crate::CARGO_ENV;
 
 use super::custom_build::BuildDeps;
@@ -671,6 +673,16 @@ enum LocalFingerprint {
     /// `output`, otherwise we need to recompile.
     RerunIfChanged {
         output: PathBuf,
+        // TODO: Possibly include a digest per PathBuf in this Vec.
+        // By not doing this, we only use mtime and no digest-based caching, and so we will re-run
+        // build scripts if they have been modified and reverted, or if they're checked out on CI
+        // with an mtime-preserved cached target directory.
+        // However, it's unclear when we could reasonably digest the file - it may change between
+        // when the rerun-if-changed line is read, and when cargo would then read the file to digest
+        // it.
+        // It's probably best to punt on this until we have a more declarative build script solution
+        // (i.e. one where build scripts declare their inputs up-front, and do less free-form
+        // imperative work) and/or better sandboxing when running build scripts.
         paths: Vec<PathBuf>,
     },
 
@@ -753,7 +765,16 @@ impl LocalFingerprint {
                         current,
                     }));
                 }
-                Ok(find_stale_file(mtime_cache, &dep_info, info.files.iter()))
+                Ok(find_stale_file(
+                    mtime_cache,
+                    &dep_info,
+                    info.files
+                        .iter()
+                        .map(|PathAndDigest { path, digest }| PathAndOptionalDigest {
+                            path: Cow::Borrowed(path),
+                            digest: Some(*digest),
+                        }),
+                ))
             }
 
             // We need to verify that no paths listed in `paths` are newer than
@@ -761,7 +782,10 @@ impl LocalFingerprint {
             LocalFingerprint::RerunIfChanged { output, paths } => Ok(find_stale_file(
                 mtime_cache,
                 &target_root.join(output),
-                paths.iter().map(|p| pkg_root.join(p)),
+                paths.iter().map(|p| PathAndOptionalDigest {
+                    path: Cow::Owned(pkg_root.join(p)),
+                    digest: None,
+                }),
             )),
 
             // These have no dependencies on the filesystem, and their values
@@ -1705,7 +1729,7 @@ pub fn parse_dep_info(
     pkg_root: &Path,
     target_root: &Path,
     dep_info: &Path,
-) -> CargoResult<Option<RustcDepInfo>> {
+) -> CargoResult<Option<CargoDepInfo>> {
     let data = match paths::read_bytes(dep_info) {
         Ok(data) => data,
         Err(_) => return Ok(None),
@@ -1717,15 +1741,15 @@ pub fn parse_dep_info(
             return Ok(None);
         }
     };
-    let mut ret = RustcDepInfo::default();
+    let mut ret = CargoDepInfo::default();
     ret.env = info.env;
-    for (ty, path) in info.files {
+    for (ty, path, digest) in info.files {
         let path = match ty {
             DepInfoPathType::PackageRootRelative => pkg_root.join(path),
             // N.B. path might be absolute here in which case the join will have no effect
             DepInfoPathType::TargetRootRelative => target_root.join(path),
         };
-        ret.files.push(path);
+        ret.files.push(PathAndDigest { path, digest });
     }
     Ok(Some(ret))
 }
@@ -1740,28 +1764,32 @@ fn pkg_fingerprint(bcx: &BuildContext<'_, '_>, pkg: &Package) -> CargoResult<Str
     source.fingerprint(pkg)
 }
 
-fn find_stale_file<I>(
+struct PathAndOptionalDigest<'a> {
+    path: Cow<'a, Path>,
+    digest: Option<u64>,
+}
+
+fn find_stale_file<'a, I>(
     mtime_cache: &mut HashMap<PathBuf, FileTime>,
     reference: &Path,
     paths: I,
 ) -> Option<StaleItem>
 where
-    I: IntoIterator,
-    I::Item: AsRef<Path>,
+    I: IntoIterator<Item = PathAndOptionalDigest<'a>>,
 {
     let reference_mtime = match paths::mtime(reference) {
         Ok(mtime) => mtime,
         Err(..) => return Some(StaleItem::MissingFile(reference.to_path_buf())),
     };
 
-    for path in paths {
-        let path = path.as_ref();
-        let path_mtime = match mtime_cache.entry(path.to_path_buf()) {
+    for path_and_digest in paths {
+        let path = path_and_digest.path.into_owned();
+        let path_mtime = match mtime_cache.entry(path.clone()) {
             Entry::Occupied(o) => *o.get(),
             Entry::Vacant(v) => {
-                let mtime = match paths::mtime_recursive(path) {
+                let mtime = match paths::mtime_recursive(&path) {
                     Ok(mtime) => mtime,
-                    Err(..) => return Some(StaleItem::MissingFile(path.to_path_buf())),
+                    Err(..) => return Some(StaleItem::MissingFile(path)),
                 };
                 *v.insert(mtime)
             }
@@ -1787,6 +1815,15 @@ where
         // measuring the start time of builds.
         if path_mtime <= reference_mtime {
             continue;
+        }
+
+        if let Some(previous_digest) = path_and_digest.digest {
+            let current_digest = StableHasher::hash_file(&path);
+            if let Ok(current_digest) = current_digest {
+                if current_digest == previous_digest {
+                    continue;
+                }
+            }
         }
 
         return Some(StaleItem::ChangedFile {
@@ -1883,10 +1920,23 @@ pub fn translate_dep_info(
         .env
         .retain(|(key, _)| !rustc_cmd.get_envs().contains_key(key) || key == CARGO_ENV);
 
-    for file in depinfo.files {
-        // The path may be absolute or relative, canonical or not. Make sure
-        // it is canonicalized so we are comparing the same kinds of paths.
-        let abs_file = rustc_cwd.join(file);
+    // TODO: Ideally rustc would output hashes of the actual bytes it read,
+    // rather than having cargo do so after the fact. This would avoid a race condition
+    // where the file may have changed between rustc reading it and cargo reading it.
+    let files_with_hashes: CargoResult<Vec<_>> = depinfo
+        .files
+        .par_iter()
+        .map(|path| {
+            // The path may be absolute or relative, canonical or not. Make sure
+            // it is canonicalized so we are comparing the same kinds of paths.
+            let abs_file = rustc_cwd.join(path);
+            let digest = StableHasher::hash_file(&abs_file)?;
+            Ok((abs_file, digest))
+        })
+        .collect();
+    let files_with_hashes = files_with_hashes.context("error hashing files from dep-info file")?;
+
+    for (abs_file, digest) in files_with_hashes {
         // If canonicalization fails, just use the abs path. There is currently
         // a bug where --remap-path-prefix is affecting .d files, causing them
         // to point to non-existent paths.
@@ -1905,7 +1955,8 @@ pub fn translate_dep_info(
             // effect.
             (DepInfoPathType::TargetRootRelative, &*abs_file)
         };
-        on_disk_info.files.push((ty, path.to_owned()));
+
+        on_disk_info.files.push((ty, path.to_owned(), digest));
     }
     paths::write(cargo_dep_info, on_disk_info.serialize()?)?;
     Ok(())
@@ -1925,6 +1976,17 @@ pub struct RustcDepInfo {
     pub env: Vec<(String, Option<String>)>,
 }
 
+pub struct PathAndDigest {
+    pub path: PathBuf,
+    pub digest: u64,
+}
+
+#[derive(Default)]
+pub struct CargoDepInfo {
+    pub files: Vec<PathAndDigest>,
+    pub env: Vec<(String, Option<String>)>,
+}
+
 // Same as `RustcDepInfo` except avoids absolute paths as much as possible to
 // allow moving around the target directory.
 //
@@ -1932,7 +1994,7 @@ pub struct RustcDepInfo {
 // Cargo will read it for crates on all future compilations.
 #[derive(Default)]
 struct EncodedDepInfo {
-    files: Vec<(DepInfoPathType, PathBuf)>,
+    files: Vec<(DepInfoPathType, PathBuf, u64)>,
     env: Vec<(String, Option<String>)>,
 }
 
@@ -1947,8 +2009,8 @@ impl EncodedDepInfo {
                 1 => DepInfoPathType::TargetRootRelative,
                 _ => return None,
             };
-            let bytes = read_bytes(bytes)?;
-            files.push((ty, paths::bytes2path(bytes).ok()?));
+            let path_bytes = read_bytes(bytes)?;
+            files.push((ty, paths::bytes2path(path_bytes).ok()?, read_u64(bytes)?));
         }
 
         let nenv = read_usize(bytes)?;
@@ -1970,6 +2032,12 @@ impl EncodedDepInfo {
             Some(u32::from_le_bytes(ret.try_into().unwrap()) as usize)
         }
 
+        fn read_u64(bytes: &mut &[u8]) -> Option<u64> {
+            let ret = bytes.get(..8)?;
+            *bytes = &bytes[8..];
+            Some(u64::from_le_bytes(ret.try_into().unwrap()))
+        }
+
         fn read_u8(bytes: &mut &[u8]) -> Option<u8> {
             let ret = *bytes.get(0)?;
             *bytes = &bytes[1..];
@@ -1988,12 +2056,13 @@ impl EncodedDepInfo {
         let mut ret = Vec::new();
         let dst = &mut ret;
         write_usize(dst, self.files.len());
-        for (ty, file) in self.files.iter() {
+        for (ty, file, digest) in self.files.iter() {
             match ty {
                 DepInfoPathType::PackageRootRelative => dst.push(0),
                 DepInfoPathType::TargetRootRelative => dst.push(1),
             }
             write_bytes(dst, paths::path2bytes(file)?);
+            write_u64(dst, *digest);
         }
 
         write_usize(dst, self.env.len());
@@ -2017,6 +2086,10 @@ impl EncodedDepInfo {
 
         fn write_usize(dst: &mut Vec<u8>, val: usize) {
             dst.extend(&u32::to_le_bytes(val as u32));
+        }
+
+        fn write_u64(dst: &mut Vec<u8>, val: u64) {
+            dst.extend(&u64::to_le_bytes(val));
         }
     }
 }
@@ -2044,6 +2117,7 @@ pub fn parse_rustc_dep_info(rustc_dep_info: &Path) -> CargoResult<RustcDepInfo> 
                 continue;
             }
             found_deps = true;
+            let mut files = Vec::new();
             let mut deps = line[pos + 2..].split_whitespace();
 
             while let Some(s) = deps.next() {
@@ -2055,7 +2129,7 @@ pub fn parse_rustc_dep_info(rustc_dep_info: &Path) -> CargoResult<RustcDepInfo> 
                         internal("malformed dep-info format, trailing \\".to_string())
                     })?);
                 }
-                ret.files.push(file.into());
+                files.push(file);
             }
         }
     }
