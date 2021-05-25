@@ -158,6 +158,7 @@ struct DrainState<'cfg> {
 
     /// How many jobs we've finished
     finished: usize,
+    finished_dirty: usize,
     per_crate_future_incompat_reports: Vec<FutureIncompatReportCrate>,
 }
 
@@ -240,7 +241,7 @@ enum Message {
     Stderr(String),
     FixDiagnostic(diagnostic_server::Message),
     Token(io::Result<Acquired>),
-    Finish(JobId, Artifact, CargoResult<()>),
+    Finish(JobId, Artifact, CargoResult<()>, Freshness),
     FutureIncompatReport(JobId, Vec<FutureBreakageItem>),
 
     // This client should get release_raw called on it with one of our tokens
@@ -292,8 +293,12 @@ impl<'a> JobState<'a> {
     /// produced once!
     pub fn rmeta_produced(&self) {
         self.rmeta_required.set(false);
-        self.messages
-            .push(Message::Finish(self.id, Artifact::Metadata, Ok(())));
+        self.messages.push(Message::Finish(
+            self.id,
+            Artifact::Metadata,
+            Ok(()),
+            Freshness::Dirty,
+        ));
     }
 
     pub fn future_incompat_report(&self, report: Vec<FutureBreakageItem>) {
@@ -403,7 +408,11 @@ impl<'cfg> JobQueue<'cfg> {
     /// This function will spawn off `config.jobs()` workers to build all of the
     /// necessary dependencies, in order. Freshness is propagated as far as
     /// possible along each dependency chain.
-    pub fn execute(mut self, cx: &mut Context<'_, '_>, plan: &mut BuildPlan) -> CargoResult<()> {
+    pub fn execute(
+        mut self,
+        cx: &mut Context<'_, '_>,
+        plan: &mut BuildPlan,
+    ) -> CargoResult<Freshness> {
         let _p = profile::start("executing the job graph");
         self.queue.queue_finished();
 
@@ -429,6 +438,7 @@ impl<'cfg> JobQueue<'cfg> {
             pending_queue: Vec::new(),
             print: DiagnosticPrinter::new(cx.bcx.config),
             finished: 0,
+            finished_dirty: 0,
             per_crate_future_incompat_reports: Vec::new(),
         };
 
@@ -458,8 +468,8 @@ impl<'cfg> JobQueue<'cfg> {
 
         crossbeam_utils::thread::scope(move |scope| {
             match state.drain_the_queue(cx, plan, scope, &helper) {
-                Some(err) => Err(err),
-                None => Ok(()),
+                NonTryResult::Ok(freshness) => Ok(freshness),
+                NonTryResult::Err(err) => Err(err),
             }
         })
         .expect("child threads shouldn't panic")
@@ -572,13 +582,16 @@ impl<'cfg> DrainState<'cfg> {
             Message::FixDiagnostic(msg) => {
                 self.print.print(&msg)?;
             }
-            Message::Finish(id, artifact, result) => {
+            Message::Finish(id, artifact, result, freshness) => {
                 let unit = match artifact {
                     // If `id` has completely finished we remove it
                     // from the `active` map ...
                     Artifact::All => {
                         info!("end: {:?}", id);
                         self.finished += 1;
+                        if freshness == Freshness::Dirty {
+                            self.finished_dirty += 1;
+                        }
                         if let Some(rustc_tokens) = self.rustc_tokens.remove(&id) {
                             // This puts back the tokens that this rustc
                             // acquired into our primary token list.
@@ -691,7 +704,7 @@ impl<'cfg> DrainState<'cfg> {
     /// This is the "main" loop, where Cargo does all work to run the
     /// compiler.
     ///
-    /// This returns an Option to prevent the use of `?` on `Result` types
+    /// This returns an NonTryResult to prevent the use of `?` on `Result` types
     /// because it is important for the loop to carefully handle errors.
     fn drain_the_queue(
         mut self,
@@ -699,7 +712,7 @@ impl<'cfg> DrainState<'cfg> {
         plan: &mut BuildPlan,
         scope: &Scope<'_>,
         jobserver_helper: &HelperThread,
-    ) -> Option<anyhow::Error> {
+    ) -> NonTryResult<Freshness> {
         trace!("queue: {:#?}", self.queue);
 
         // Iteratively execute the entire dependency graph. Each turn of the
@@ -769,7 +782,7 @@ impl<'cfg> DrainState<'cfg> {
             if error.is_some() {
                 crate::display_error(&e, &mut cx.bcx.config.shell());
             } else {
-                return Some(e);
+                return NonTryResult::Err(e);
             }
         }
         if cx.bcx.build_config.emit_json() {
@@ -782,13 +795,13 @@ impl<'cfg> DrainState<'cfg> {
                 if error.is_some() {
                     crate::display_error(&e.into(), &mut shell);
                 } else {
-                    return Some(e.into());
+                    return NonTryResult::Err(e.into());
                 }
             }
         }
 
         if let Some(e) = error {
-            Some(e)
+            NonTryResult::Err(e)
         } else if self.queue.is_empty() && self.pending_queue.is_empty() {
             let message = format!(
                 "{} [{}] target(s) in {}",
@@ -800,10 +813,14 @@ impl<'cfg> DrainState<'cfg> {
                 self.emit_future_incompat(cx);
             }
 
-            None
+            NonTryResult::Ok(if self.finished_dirty == 0 {
+                Freshness::Fresh
+            } else {
+                Freshness::Dirty
+            })
         } else {
             debug!("queue: {:#?}", self.queue);
-            Some(internal("finished with jobs still left in the queue"))
+            NonTryResult::Err(internal("finished with jobs still left in the queue"))
         }
     }
 
@@ -982,6 +999,7 @@ impl<'cfg> DrainState<'cfg> {
                 messages: &state.messages,
                 id,
                 result: None,
+                freshness: fresh,
             };
             sender.result = Some(job.run(&state));
 
@@ -1000,7 +1018,7 @@ impl<'cfg> DrainState<'cfg> {
             if state.rmeta_required.get() && sender.result.as_ref().unwrap().is_ok() {
                 state
                     .messages
-                    .push(Message::Finish(state.id, Artifact::Metadata, Ok(())));
+                    .push(Message::Finish(state.id, Artifact::Metadata, Ok(()), fresh));
             }
 
             // Use a helper struct with a `Drop` implementation to guarantee
@@ -1011,6 +1029,7 @@ impl<'cfg> DrainState<'cfg> {
                 messages: &'a Queue<Message>,
                 id: JobId,
                 result: Option<CargoResult<()>>,
+                freshness: Freshness,
             }
 
             impl Drop for FinishOnDrop<'_> {
@@ -1019,8 +1038,12 @@ impl<'cfg> DrainState<'cfg> {
                         .result
                         .take()
                         .unwrap_or_else(|| Err(format_err!("worker panicked")));
-                    self.messages
-                        .push(Message::Finish(self.id, Artifact::All, result));
+                    self.messages.push(Message::Finish(
+                        self.id,
+                        Artifact::All,
+                        result,
+                        self.freshness,
+                    ));
                 }
             }
         };
@@ -1154,4 +1177,11 @@ impl<'cfg> DrainState<'cfg> {
         }
         Ok(())
     }
+}
+
+/// NonTryResult exists to be able to return a Result but disallow use of ? so that errors must
+/// be carefully considered and handled.
+enum NonTryResult<T> {
+    Ok(T),
+    Err(anyhow::Error),
 }

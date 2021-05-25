@@ -7,7 +7,7 @@ use filetime::FileTime;
 use jobserver::Client;
 
 use crate::core::compiler::compilation::{self, UnitOutput};
-use crate::core::compiler::{self, Unit};
+use crate::core::compiler::{self, Freshness, Unit};
 use crate::core::PackageId;
 use crate::util::errors::CargoResult;
 use crate::util::profile;
@@ -169,7 +169,7 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
         }
 
         // Now that we've figured out everything that we're going to do, do it!
-        queue.execute(&mut self, &mut plan)?;
+        let freshness = queue.execute(&mut self, &mut plan)?;
 
         if build_plan {
             plan.set_inputs(self.build_plan_inputs()?);
@@ -263,7 +263,10 @@ impl<'a, 'cfg> Context<'a, 'cfg> {
                 });
             }
 
-            super::output_depinfo(&mut self, unit)?;
+            match freshness {
+                Freshness::Dirty => super::output_depinfo(&mut self, unit)?,
+                Freshness::Fresh => {}
+            }
         }
 
         for (script_meta, output) in self.build_script_outputs.lock().unwrap().iter() {
